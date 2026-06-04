@@ -1,0 +1,32 @@
+# Arduino build outputs
+build/
+*.hex
+*.elf
+*.bin
+*.map
+*.eep
+*.lss
+*.sym
+
+# Arduino IDE local files
+*.ino.cpp
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# PlatformIO, if used later
+.pio/
+.pioenvs/
+.piolibdeps/
+platformio.ini.user
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
