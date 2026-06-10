@@ -6,8 +6,9 @@
 ![Bluetooth](https://img.shields.io/badge/Bluetooth-0082FC?style=for-the-badge&logo=bluetooth&logoColor=white)
 ![License MIT](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 
-Projeto acadêmico de **Microcontroladores** para a **Avaliação P2 de 2026**.  
-O firmware simula uma máquina de lavar doméstica usando **ESP32 Dev Module**, **LCD 16x2 I2C**, **teclado matricial 4x4**, **MCP23017**, **ADC**, **PWM**, **Bluetooth** e atuadores simulados.
+Projeto acadêmico de **Microcontroladores** para a **Avaliação P2 de 2026**.
+
+O firmware simula uma máquina de lavar doméstica usando **ESP32 Dev Module**, LCD 16x2 I2C, teclado matricial 4x4, MCP23017, ADC, PWM, Bluetooth e atuadores simulados.
 
 > Código principal: [`Microcontroladores.ino`](Microcontroladores.ino)  
 > Fluxograma completo: [`Fluxograma.md`](Fluxograma.md)
@@ -16,80 +17,78 @@ O firmware simula uma máquina de lavar doméstica usando **ESP32 Dev Module**, 
 
 ## ✨ Visão Geral
 
-O sistema implementa uma máquina de estados para controlar as etapas de lavagem:
-
 ```mermaid
 flowchart LR
-  IDLE[Idle] --> DELAY[Atraso<br/>Grupo 4]
-  IDLE --> LOCK[Trava]
-  DELAY --> LOCK
-  LOCK --> FILL[Enchimento]
+  IDLE[Idle] --> LOCK[Trava]
+  LOCK --> FILL[Enchimento<br/>inteligente]
   FILL --> WASH[Lavagem<br/>PWM]
   WASH --> DRAIN1[Escoamento]
-  DRAIN1 --> RFILL[Enchimento<br/>Enxágue]
-  RFILL --> RINSE[Enxágue<br/>Grupo 9]
+  DRAIN1 --> RFILL[Enchimento<br/>do enxágue]
+  RFILL --> RINSE[Enxágue<br/>PWM]
   RINSE --> DRAIN2[Escoamento]
   DRAIN2 --> SPIN[Centrifugação<br/>PWM]
   SPIN --> DONE[Fim]
   DONE --> IDLE
 ```
 
-O fluxo detalhado, incluindo teclado, Bluetooth e estados de erro, está em [`Fluxograma.md`](Fluxograma.md).
+O sistema utiliza uma máquina de estados, temporizações com `esp_timer` e comunicação Bluetooth não bloqueante.
 
 ---
 
-## 🎯 Objetivos do Projeto
+## 🎯 Requisitos Implementados
 
-- Criar uma interface local com **LCD 16x2** e **teclado 4x4**.
-- Simular o nível de água por **ADC** usando um potenciômetro.
-- Controlar **válvula**, **bomba** e **trava de porta** por saídas digitais.
-- Controlar o **motor por PWM real** no ESP32.
-- Monitorar e controlar o sistema por **Bluetooth Serial**.
-- Usar temporização com **`esp_timer`**, sem `delay()` e sem `millis()`.
-- Implementar uma **máquina de estados** para o ciclo da máquina de lavar.
+- Interface local com LCD 16x2 e teclado 4x4.
+- Leitura de nível de água por ADC usando potenciômetro.
+- Controle digital de válvula, bomba e trava de porta.
+- Controle PWM real do motor no ESP32.
+- Monitoramento e controle por Bluetooth Serial.
+- Temporização baseada em `esp_timer`, sem `delay()` e sem `millis()`.
+- Máquina de estados para todas as etapas do ciclo.
+- Tratamento de falhas por timeout de enchimento e escoamento.
 
 ---
 
-## 🧩 Especializações
+## 💧 Grupo 1: Controle de Nível Inteligente
 
-### ⏱️ Grupo 4: Modo Atraso
+A especialização possui duas partes.
 
-Permite programar um atraso antes do início do ciclo.
+### Tempo de enchimento adaptativo
 
-**Pelo teclado**
-
-| Tecla | Ação |
-| --- | --- |
-| `A` | Entra no modo de configuração do atraso |
-| `0` a `9` | Digita o atraso em horas |
-| `#` | Confirma o atraso |
-| `*` | Cancela a edição |
-| `1` | Inicia o ciclo |
-| `0` | Zera o atraso configurado |
-
-**Pelo Bluetooth**
+Antes de cada enchimento, o firmware calcula quanto falta para atingir o nível-alvo:
 
 ```text
-DELAY:3
-START
+déficit (%) = nível-alvo (%) - nível-atual (%)
+tempo estimado (ms) = déficit (%) × 400 ms
 ```
 
-Para facilitar a demonstração em bancada, cada hora configurada equivale a **15 segundos reais**:
+O resultado é limitado entre 3 e 30 segundos:
 
 ```cpp
-static const uint32_t DEMO_DELAY_PER_HOUR_MS = 15000;
+static const uint32_t FILL_MS_PER_PERCENT = 400;
+static const uint32_t MIN_FILL_TIMEOUT_MS = 3000;
+static const uint32_t MAX_FILL_TIMEOUT_MS = 30000;
 ```
 
-### 💧 Grupo 9: Ciclo Econômico Adaptativo
+Exemplo:
 
-Antes de iniciar o ciclo, o firmware lê o nível de água pelo ADC.  
-Se o nível inicial estiver baixo, o modo econômico é ativado e o tempo de enxágue é reduzido.
-
-```cpp
-static const int ECO_START_THRESHOLD_PCT = 35;
-static const uint32_t RINSE_BASE_MS = 9000;
-static const uint32_t RINSE_ECO_MS = 5000;
+```text
+Nível atual: 20%
+Alvo da lavagem: 65%
+Déficit: 45%
+Tempo calculado: 45 × 400 = 18.000 ms
 ```
+
+O enchimento termina assim que o ADC alcança o nível-alvo. O tempo calculado funciona como limite inteligente de segurança.
+
+### Gráfico de nível pelo Bluetooth
+
+O ESP32 transmite um gráfico textual do nível a cada segundo:
+
+```text
+LEVEL [############--------] 60%
+```
+
+O envio automático pode ser ativado ou desativado por Bluetooth ou pela tecla `A`.
 
 ---
 
@@ -98,13 +97,13 @@ static const uint32_t RINSE_ECO_MS = 5000;
 | Componente | Função |
 | --- | --- |
 | ESP32 Dev Module | Microcontrolador principal |
-| LCD 16x2 I2C | Exibe estado, nível, atuadores e Bluetooth |
+| LCD 16x2 I2C | Exibe estado, nível e atuadores |
 | MCP23017 | Expansor de IO para teclado e atuadores |
 | Teclado matricial 4x4 | Entrada local de comandos |
-| Potenciômetro | Simula o nível de água no ADC |
+| Potenciômetro | Simula o nível de água |
 | LEDs ou relés | Simulam válvula, bomba e trava |
 | Motor DC, cooler ou LED | Demonstra o PWM do motor |
-| Bluetooth Serial | Controle e monitoramento remoto |
+| Bluetooth Serial | Controle e gráfico remoto |
 
 ---
 
@@ -119,7 +118,7 @@ static const uint32_t RINSE_ECO_MS = 5000;
 | `GPIO 34` | ADC do nível de água |
 | `GPIO 25` | PWM do motor |
 
-### I2C
+### Barramento I2C
 
 | Dispositivo | Endereço |
 | --- | --- |
@@ -139,25 +138,37 @@ static const uint32_t RINSE_ECO_MS = 5000;
 
 ---
 
+## ⌨️ Comandos do Teclado
+
+| Tecla | Ação |
+| --- | --- |
+| `1` | Inicia o ciclo |
+| `2` | Cancela o ciclo |
+| `3` | Envia status e gráfico pelo Bluetooth |
+| `A` | Liga ou desliga o gráfico automático |
+
+---
+
 ## 📲 Comandos Bluetooth
 
 Nome do dispositivo:
 
 ```text
-ESP32_G4_G9_WASHER
+ESP32_G1_WASHER
 ```
 
 | Comando | Função |
 | --- | --- |
 | `PING` | Testa a conexão e responde `PONG` |
-| `STATUS` | Envia estado, ADC, nível, atraso e atuadores |
+| `STATUS` | Envia estado, ADC, nível e atuadores |
 | `START` | Inicia o ciclo |
 | `STOP` | Cancela o ciclo |
 | `ADC` | Envia a leitura atual do ADC |
-| `DELAY:x` | Configura atraso remoto, exemplo: `DELAY:2` |
-| `ECO?` | Informa se o modo econômico está ativo |
-| `MOTOR:x` | Testa PWM manualmente, de `0` a `255` |
-| `HELP` | Lista comandos principais |
+| `GRAPH` | Envia um gráfico imediatamente |
+| `GRAPH:ON` | Ativa o gráfico automático |
+| `GRAPH:OFF` | Desativa o gráfico automático |
+| `MOTOR:x` | Testa o PWM de `0` a `255` |
+| `HELP` | Lista os comandos |
 
 ---
 
@@ -165,18 +176,17 @@ ESP32_G4_G9_WASHER
 
 | Estado | Função |
 | --- | --- |
-| `ST_IDLE` | Sistema parado, atuadores desligados |
-| `ST_WAIT_DELAY` | Aguarda atraso programado do Grupo 4 |
+| `ST_IDLE` | Sistema parado |
 | `ST_LOCK_DOOR` | Aciona a trava da porta |
-| `ST_FILL_WASH` | Enche água para lavagem |
-| `ST_WASH` | Lava com PWM no motor |
-| `ST_DRAIN_WASH` | Escoa água da lavagem |
-| `ST_FILL_RINSE` | Enche água para enxágue |
-| `ST_RINSE` | Enxágua em modo normal ou econômico |
-| `ST_DRAIN_RINSE` | Escoa água do enxágue |
-| `ST_SPIN` | Centrifuga com PWM mais alto |
-| `ST_COMPLETE` | Finaliza e retorna ao repouso |
-| `ST_FAULT` | Falha controlada por timeout |
+| `ST_FILL_WASH` | Enchimento inteligente para lavagem |
+| `ST_WASH` | Lavagem com PWM |
+| `ST_DRAIN_WASH` | Escoamento da lavagem |
+| `ST_FILL_RINSE` | Enchimento inteligente para enxágue |
+| `ST_RINSE` | Enxágue com PWM |
+| `ST_DRAIN_RINSE` | Escoamento do enxágue |
+| `ST_SPIN` | Centrifugação com PWM mais alto |
+| `ST_COMPLETE` | Finalização do ciclo |
+| `ST_FAULT` | Estado seguro após timeout |
 
 ---
 
@@ -186,9 +196,9 @@ Instale no Arduino IDE:
 
 - **ESP32 Arduino Core**
 - **LiquidCrystal_I2C**
-- **Adafruit MCP23017 Arduino Library** ou biblioteca Adafruit MCP23X17 compatível com `Adafruit_MCP23X17`
+- **Adafruit MCP23017 Arduino Library** ou biblioteca compatível com `Adafruit_MCP23X17`
 
-Bibliotecas nativas usadas pelo core ESP32:
+Bibliotecas nativas do core ESP32:
 
 - `Arduino.h`
 - `Wire.h`
@@ -197,32 +207,32 @@ Bibliotecas nativas usadas pelo core ESP32:
 
 ---
 
-## 🚀 Como Rodar
+## 🚀 Como Executar
 
 1. Abra `Microcontroladores.ino` no Arduino IDE.
 2. Selecione a placa `ESP32 Dev Module`.
-3. Escolha a porta serial correta.
+3. Selecione a porta serial correta.
 4. Instale as bibliotecas necessárias.
-5. Compile e envie para o ESP32.
+5. Compile e envie o firmware.
 6. Abra o monitor serial em `115200`.
-7. Conecte pelo Bluetooth ao dispositivo `ESP32_G4_G9_WASHER`.
+7. Conecte ao Bluetooth `ESP32_G1_WASHER`.
 
 ---
 
-## 🧪 Demonstração Recomendada
+## 🧪 Roteiro de Demonstração
 
-| Demonstração | Como fazer |
+| Demonstração | Procedimento |
 | --- | --- |
-| PWM do motor | Use `MOTOR:180` pelo Bluetooth ou observe os estados `ST_WASH`, `ST_RINSE` e `ST_SPIN` |
-| Grupo 4 | Envie `DELAY:1` e depois `START`, ou configure pelo teclado com `A`, `1`, `#`, `1` |
-| Grupo 9 | Deixe o potenciômetro abaixo de 35% antes de iniciar o ciclo |
-| Enchimento | Gire o potenciômetro para simular o nível subindo |
-| Escoamento | Gire o potenciômetro para simular o nível descendo |
-| Bluetooth | Use `STATUS`, `ADC`, `ECO?`, `START` e `STOP` |
+| Nível inteligente | Posicione o potenciômetro em níveis diferentes antes de cada enchimento e mostre `FILL_ESTIMATE_MS` |
+| Gráfico Bluetooth | Envie `GRAPH:ON` e gire o potenciômetro |
+| Enchimento | Aumente gradualmente o potenciômetro até o nível-alvo |
+| Escoamento | Reduza gradualmente o potenciômetro até 10% |
+| PWM do motor | Observe lavagem, enxágue e centrifugação ou envie `MOTOR:180` |
+| Falha de segurança | Não altere o nível durante o enchimento e aguarde o timeout adaptativo |
 
 ---
 
-## 📁 Estrutura do Repositório
+## 📁 Estrutura
 
 ```text
 .
@@ -238,5 +248,4 @@ Bibliotecas nativas usadas pelo core ESP32:
 
 ## 📄 Licença
 
-Este projeto está licenciado sob a licença **MIT**.  
-Consulte [`LICENSE`](LICENSE) para mais detalhes.
+Distribuído sob a licença **MIT**. Consulte [`LICENSE`](LICENSE).

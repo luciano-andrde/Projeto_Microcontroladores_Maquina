@@ -15,7 +15,7 @@ BluetoothSerial SerialBT;
 #define MCP_ADDR 0x21
 #define ADC_NIVEL 34
 #define MOTOR_PWM_PIN 25
-#define BT_NAME "ESP32_G4_G9_WASHER"
+#define BT_NAME "ESP32_G1_WASHER"
 
 // Bloco: Linhas e colunas do teclado 4x4 ligado ao MCP23017.
 #define ROW1 0
@@ -43,31 +43,27 @@ static const uint8_t MOTOR_PWM_SPIN = 220;
 
 // Bloco: Tempos do processo em milissegundos para a demonstracao da bancada.
 static const uint32_t DOOR_LOCK_MS = 1500;
-static const uint32_t FILL_TIMEOUT_MS = 30000;
 static const uint32_t WASH_MS = 15000;
 static const uint32_t DRAIN_TIMEOUT_MS = 12000;
 static const uint32_t RINSE_BASE_MS = 9000;
-static const uint32_t RINSE_ECO_MS = 5000;
 static const uint32_t SPIN_MS = 10000;
 static const uint32_t COMPLETE_MS = 4000;
 static const uint32_t LCD_REFRESH_MS = 250;
 static const uint32_t STATUS_PUSH_MS = 1000;
 
-// Bloco: GRUPO 4 - Escala do atraso programavel.
-// Para a demonstracao, 1 hora configurada equivale a 15 segundos reais.
-static const uint32_t DEMO_DELAY_PER_HOUR_MS = 15000;
-
-// Bloco: GRUPO 9 - Limites do ciclo economico adaptativo.
-// Se o nivel inicial estiver baixo, o enxague fica mais curto para simular economia de agua.
+// Bloco: GRUPO 1 - Parametros do controle inteligente de nivel.
+// O tempo previsto de enchimento varia conforme a diferenca entre o nivel atual e o alvo.
 static const int TARGET_WASH_LEVEL_PCT = 65;
 static const int TARGET_RINSE_LEVEL_PCT = 50;
 static const int DRAIN_EMPTY_LEVEL_PCT = 10;
-static const int ECO_START_THRESHOLD_PCT = 35;
+static const uint32_t FILL_MS_PER_PERCENT = 400;
+static const uint32_t MIN_FILL_TIMEOUT_MS = 3000;
+static const uint32_t MAX_FILL_TIMEOUT_MS = 30000;
+static const uint8_t LEVEL_GRAPH_WIDTH = 20;
 
 // Bloco: Estados principais da maquina de lavar exigida na avaliacao.
 enum WashState {
   ST_IDLE,
-  ST_WAIT_DELAY,
   ST_LOCK_DOOR,
   ST_FILL_WASH,
   ST_WASH,
@@ -98,24 +94,11 @@ bool pumpOn = false;
 bool doorLocked = false;
 bool auxLedOn = false;
 bool btConnected = false;
-
-// Bloco: GRUPO 9 - Guarda se o ciclo economico adaptativo foi ativado no inicio do ciclo.
-bool ecoModeActive = false;
-
-// Bloco: GRUPO 4 - Variaveis do atraso configurado por teclado ou Bluetooth.
-bool delayEditMode = false;
-char delayDigits[3] = "";
-uint8_t delayDigitCount = 0;
-uint8_t configuredDelayHours = 0;
-uint8_t scheduledDelayHours = 0;
-uint32_t scheduledDelayMs = 0;
-uint32_t delayDeadlineMs = 0;
 char lastKey = '-';
 int lastAdcRaw = 0;
 int lastLevelPct = 0;
-
-// Bloco: GRUPO 9 - Duracao do enxague muda conforme o nivel de agua inicial.
-int rinseDurationMs = RINSE_BASE_MS;
+uint32_t adaptiveFillTimeoutMs = MAX_FILL_TIMEOUT_MS;
+bool graphStreamingEnabled = true;
 char lcdLine1[17] = "";
 char lcdLine2[17] = "";
 char btBuffer[32] = "";
@@ -142,7 +125,6 @@ bool elapsedMs(uint32_t startedAt, uint32_t intervalMs) {
 const char *stateName(WashState state) {
   switch (state) {
     case ST_IDLE: return "IDLE";
-    case ST_WAIT_DELAY: return "DELAY";
     case ST_LOCK_DOOR: return "LOCK";
     case ST_FILL_WASH: return "FILL";
     case ST_WASH: return "WASH";
@@ -266,16 +248,34 @@ char getKeyEvent() {
   return 0;
 }
 
-// Bloco: GRUPO 4 - Reinicia o buffer usado para edicao do atraso no teclado.
-void resetDelayEdit() {
-  delayDigits[0] = '\0';
-  delayDigitCount = 0;
-}
-
 // Bloco: Entra em um novo estado e atualiza a marca de tempo correspondente.
 void enterState(WashState nextState) {
   currentState = nextState;
   stateStartedMs = nowMs();
+}
+
+// Bloco: GRUPO 1 - Calcula o tempo de enchimento pelo nivel atual e nivel desejado.
+uint32_t calculateAdaptiveFillTimeout(int currentLevelPct, int targetLevelPct) {
+  int missingLevelPct = targetLevelPct - currentLevelPct;
+  if (missingLevelPct < 1) missingLevelPct = 1;
+
+  uint32_t estimatedMs = (uint32_t)missingLevelPct * FILL_MS_PER_PERCENT;
+  return constrain(estimatedMs, MIN_FILL_TIMEOUT_MS, MAX_FILL_TIMEOUT_MS);
+}
+
+// Bloco: GRUPO 1 - Prepara cada enchimento com um tempo calculado automaticamente.
+void prepareAdaptiveFill(int targetLevelPct) {
+  readLevelAdc();
+  adaptiveFillTimeoutMs = calculateAdaptiveFillTimeout(lastLevelPct, targetLevelPct);
+
+  Serial.print("FILL ESTIMATE: ");
+  Serial.print(adaptiveFillTimeoutMs);
+  Serial.println(" ms");
+
+  if (btOk) {
+    SerialBT.print("FILL_ESTIMATE_MS=");
+    SerialBT.println(adaptiveFillTimeoutMs);
+  }
 }
 
 // Bloco: Abre falha controlada para exibir erro e travar o ciclo com seguranca.
@@ -289,41 +289,21 @@ void enterFault(const String &reason) {
   }
 }
 
-// Bloco: GRUPO 4 e GRUPO 9 - Inicia o ciclo aplicando atraso e modo economico.
+// Bloco: Inicia o ciclo principal da maquina de lavar.
 void requestCycleStart() {
   if (currentState != ST_IDLE && currentState != ST_COMPLETE) {
     return;
   }
 
-  // GRUPO 9: decide o ciclo economico pelo nivel de agua lido no ADC antes de iniciar.
   readLevelAdc();
-  ecoModeActive = (lastLevelPct <= ECO_START_THRESHOLD_PCT);
-  rinseDurationMs = ecoModeActive ? RINSE_ECO_MS : RINSE_BASE_MS;
-
-  // GRUPO 4: converte o atraso em horas para tempo de demonstracao.
-  scheduledDelayHours = configuredDelayHours;
-  scheduledDelayMs = (uint32_t)scheduledDelayHours * DEMO_DELAY_PER_HOUR_MS;
   setAuxLed(true);
   faultReason = "";
-
-  // GRUPO 4: se existir atraso configurado, entra primeiro no estado ST_WAIT_DELAY.
-  if (scheduledDelayMs > 0) {
-    delayDeadlineMs = nowMs() + scheduledDelayMs;
-    enterState(ST_WAIT_DELAY);
-  } else {
-    enterState(ST_LOCK_DOOR);
-  }
+  enterState(ST_LOCK_DOOR);
 }
 
 // Bloco: Cancela o ciclo e retorna ao estado ocioso.
 void cancelCycle(const String &reason) {
   stopAllActuators();
-  configuredDelayHours = 0;
-  scheduledDelayHours = 0;
-  scheduledDelayMs = 0;
-  delayDeadlineMs = 0;
-  delayEditMode = false;
-  resetDelayEdit();
   faultReason = reason;
   enterState(ST_IDLE);
   Serial.println("CANCEL: " + reason);
@@ -332,27 +312,8 @@ void cancelCycle(const String &reason) {
   }
 }
 
-// Bloco: GRUPO 4 - Calcula o tempo restante do atraso programado para o LCD e Bluetooth.
-uint32_t remainingDelayMs() {
-  if (currentState != ST_WAIT_DELAY) return 0;
-  uint32_t current = nowMs();
-  if (current >= delayDeadlineMs) return 0;
-  return delayDeadlineMs - current;
-}
-
 // Bloco: Monta a primeira linha do LCD de acordo com o estado do sistema.
 void buildLcdLine1(char *out, size_t outSize) {
-  if (delayEditMode) {
-    snprintf(out, outSize, "ATRASO:%sh", delayDigitCount ? delayDigits : "_");
-    return;
-  }
-
-  if (currentState == ST_WAIT_DELAY) {
-    uint32_t remainSec = remainingDelayMs() / 1000UL;
-    snprintf(out, outSize, "START %2lus ECO%c", remainSec, ecoModeActive ? '1' : '0');
-    return;
-  }
-
   if (currentState == ST_FAULT) {
     snprintf(out, outSize, "FAULT %-10s", "CHECK");
     return;
@@ -363,13 +324,8 @@ void buildLcdLine1(char *out, size_t outSize) {
 
 // Bloco: Monta a segunda linha do LCD com atuadores e conectividade.
 void buildLcdLine2(char *out, size_t outSize) {
-  if (delayEditMode) {
-    snprintf(out, outSize, "#OK *ESC A=%uh", configuredDelayHours);
-    return;
-  }
-
   if (currentState == ST_FAULT) {
-    snprintf(out, outSize, "BT%c D:%uh", btConnected ? '+' : '-', configuredDelayHours);
+    snprintf(out, outSize, "BT%c FILL:%lus", btConnected ? '+' : '-', adaptiveFillTimeoutMs / 1000UL);
     return;
   }
 
@@ -382,6 +338,20 @@ void buildLcdLine2(char *out, size_t outSize) {
     doorLocked ? '1' : '0',
     btConnected ? '+' : '-'
   );
+}
+
+// Bloco: GRUPO 1 - Envia um grafico textual do nivel de agua pelo Bluetooth.
+void sendLevelGraph() {
+  if (!btOk) return;
+
+  int filledBars = map(lastLevelPct, 0, 100, 0, LEVEL_GRAPH_WIDTH);
+  SerialBT.print("LEVEL [");
+  for (int i = 0; i < LEVEL_GRAPH_WIDTH; i++) {
+    SerialBT.print(i < filledBars ? '#' : '-');
+  }
+  SerialBT.print("] ");
+  SerialBT.print(lastLevelPct);
+  SerialBT.println("%");
 }
 
 // Bloco: Atualiza o LCD sem limpar a tela a cada loop, evitando flicker.
@@ -422,9 +392,7 @@ void sendBluetoothStatus() {
   SerialBT.print("STATE="); SerialBT.print(stateName(currentState));
   SerialBT.print(" ADC="); SerialBT.print(lastAdcRaw);
   SerialBT.print(" LEVEL="); SerialBT.print(lastLevelPct);
-  SerialBT.print(" ECO="); SerialBT.print(ecoModeActive ? 1 : 0);
-  SerialBT.print(" DELAY_H="); SerialBT.print(configuredDelayHours);
-  SerialBT.print(" REMAIN_MS="); SerialBT.print(remainingDelayMs());
+  SerialBT.print(" FILL_LIMIT_MS="); SerialBT.print(adaptiveFillTimeoutMs);
   SerialBT.print(" VALVE="); SerialBT.print(valveOn ? 1 : 0);
   SerialBT.print(" PUMP="); SerialBT.print(pumpOn ? 1 : 0);
   SerialBT.print(" LOCK="); SerialBT.print(doorLocked ? 1 : 0);
@@ -438,6 +406,9 @@ void pushStatusIfNeeded() {
   if (!elapsedMs(lastStatusPushMs, STATUS_PUSH_MS)) return;
   lastStatusPushMs = nowMs();
   sendBluetoothStatus();
+  if (graphStreamingEnabled) {
+    sendLevelGraph();
+  }
 }
 
 // Bloco: Interpreta comandos completos recebidos pela serial Bluetooth.
@@ -461,19 +432,18 @@ void handleBluetoothCommand(String cmd) {
     SerialBT.print(" LEVEL="); SerialBT.print(lastLevelPct);
     SerialBT.println("%");
   } else if (cmd == "HELP") {
-    SerialBT.println("CMD: START STOP STATUS ADC DELAY:x ECO? MOTOR:x");
-  } else if (cmd == "ECO?") {
-    // GRUPO 9: comando para verificar se o ciclo economico esta ativo.
-    SerialBT.print("ECO="); SerialBT.println(ecoModeActive ? 1 : 0);
-  } else if (cmd.startsWith("DELAY:")) {
-    // GRUPO 4: comando remoto para configurar o atraso antes do START.
-    int hours = cmd.substring(6).toInt();
-    if (hours >= 0 && hours <= 24) {
-      configuredDelayHours = (uint8_t)hours;
-      SerialBT.print("DELAY SET "); SerialBT.print(configuredDelayHours); SerialBT.println("H");
-    } else {
-      SerialBT.println("ERR DELAY 0..24");
-    }
+    SerialBT.println("CMD: START STOP STATUS ADC GRAPH GRAPH:ON GRAPH:OFF MOTOR:x");
+  } else if (cmd == "GRAPH") {
+    // GRUPO 1: envia imediatamente o grafico do nivel.
+    sendLevelGraph();
+  } else if (cmd == "GRAPH:ON") {
+    // GRUPO 1: ativa o envio periodico do grafico pelo Bluetooth.
+    graphStreamingEnabled = true;
+    SerialBT.println("GRAPH STREAM ON");
+  } else if (cmd == "GRAPH:OFF") {
+    // GRUPO 1: desativa o envio periodico do grafico pelo Bluetooth.
+    graphStreamingEnabled = false;
+    SerialBT.println("GRAPH STREAM OFF");
   } else if (cmd.startsWith("MOTOR:")) {
     int duty = cmd.substring(6).toInt();
     duty = constrain(duty, 0, 255);
@@ -511,30 +481,6 @@ void processBluetooth() {
   }
 }
 
-// Bloco: GRUPO 4 - Trata a edicao do atraso programado pelo teclado.
-void handleDelayEditing(char key) {
-  if (key >= '0' && key <= '9' && delayDigitCount < 2) {
-    delayDigits[delayDigitCount++] = key;
-    delayDigits[delayDigitCount] = '\0';
-    return;
-  }
-
-  if (key == '#') {
-    int hours = atoi(delayDigits);
-    if (hours >= 0 && hours <= 24) {
-      configuredDelayHours = (uint8_t)hours;
-    }
-    delayEditMode = false;
-    resetDelayEdit();
-    return;
-  }
-
-  if (key == '*') {
-    delayEditMode = false;
-    resetDelayEdit();
-  }
-}
-
 // Bloco: Interpreta as teclas do painel frontal conforme o modo atual.
 void processKeypad() {
   char key = getKeyEvent();
@@ -545,18 +491,6 @@ void processKeypad() {
   if (btOk) {
     SerialBT.print("KEY:");
     SerialBT.println(key);
-  }
-
-  if (delayEditMode) {
-    handleDelayEditing(key);
-    return;
-  }
-
-  if (key == 'A') {
-    // GRUPO 4: tecla A entra no modo de configuracao do atraso.
-    delayEditMode = true;
-    resetDelayEdit();
-    return;
   }
 
   if (key == '1') {
@@ -571,11 +505,13 @@ void processKeypad() {
 
   if (key == '3' && btOk) {
     sendBluetoothStatus();
+    sendLevelGraph();
     return;
   }
 
-  if (key == '0') {
-    configuredDelayHours = 0;
+  if (key == 'A' && btOk) {
+    graphStreamingEnabled = !graphStreamingEnabled;
+    SerialBT.println(graphStreamingEnabled ? "GRAPH STREAM ON" : "GRAPH STREAM OFF");
     return;
   }
 }
@@ -587,19 +523,12 @@ void runStateMachine() {
       stopAllActuators();
       break;
 
-    case ST_WAIT_DELAY:
-      // GRUPO 4: estado que segura o inicio do ciclo ate o timer programado terminar.
-      stopAllActuators();
-      setAuxLed(true);
-      if (remainingDelayMs() == 0) {
-        enterState(ST_LOCK_DOOR);
-      }
-      break;
-
     case ST_LOCK_DOOR:
       setDoorLock(true);
       setAuxLed(true);
       if (elapsedMs(stateStartedMs, DOOR_LOCK_MS)) {
+        // GRUPO 1: calcula o tempo de enchimento usando o nivel atual.
+        prepareAdaptiveFill(TARGET_WASH_LEVEL_PCT);
         enterState(ST_FILL_WASH);
       }
       break;
@@ -611,7 +540,7 @@ void runStateMachine() {
       if (lastLevelPct >= TARGET_WASH_LEVEL_PCT) {
         setValve(false);
         enterState(ST_WASH);
-      } else if (elapsedMs(stateStartedMs, FILL_TIMEOUT_MS)) {
+      } else if (elapsedMs(stateStartedMs, adaptiveFillTimeoutMs)) {
         enterFault("FILL TIMEOUT");
       }
       break;
@@ -633,6 +562,8 @@ void runStateMachine() {
       setMotorDuty(0);
       if (lastLevelPct <= DRAIN_EMPTY_LEVEL_PCT) {
         setPump(false);
+        // GRUPO 1: recalcula o tempo para o enchimento do enxague.
+        prepareAdaptiveFill(TARGET_RINSE_LEVEL_PCT);
         enterState(ST_FILL_RINSE);
       } else if (elapsedMs(stateStartedMs, DRAIN_TIMEOUT_MS)) {
         enterFault("DRAIN1 TIMEOUT");
@@ -646,18 +577,17 @@ void runStateMachine() {
       if (lastLevelPct >= TARGET_RINSE_LEVEL_PCT) {
         setValve(false);
         enterState(ST_RINSE);
-      } else if (elapsedMs(stateStartedMs, FILL_TIMEOUT_MS)) {
+      } else if (elapsedMs(stateStartedMs, adaptiveFillTimeoutMs)) {
         enterFault("RINSE FILL TO");
       }
       break;
 
     case ST_RINSE:
-      // GRUPO 9: usa RINSE_ECO_MS ou RINSE_BASE_MS conforme o nivel inicial do ADC.
       setValve(false);
       setPump(false);
       setDoorLock(true);
       setMotorDuty(MOTOR_PWM_RINSE);
-      if (elapsedMs(stateStartedMs, (uint32_t)rinseDurationMs)) {
+      if (elapsedMs(stateStartedMs, RINSE_BASE_MS)) {
         setMotorDuty(0);
         enterState(ST_DRAIN_RINSE);
       }
@@ -688,7 +618,6 @@ void runStateMachine() {
 
     case ST_COMPLETE:
       stopAllActuators();
-      configuredDelayHours = 0;
       if (elapsedMs(stateStartedMs, COMPLETE_MS)) {
         enterState(ST_IDLE);
       }
