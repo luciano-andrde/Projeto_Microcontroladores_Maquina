@@ -33,8 +33,7 @@ BluetoothSerial SerialBT;
 #define MCP_VALVULA 14
 #define MCP_AUX_LED 15
 
-// Bloco: Parametros do PWM real do motor no ESP32.
-static const uint8_t MOTOR_PWM_CHANNEL = 0;
+// Bloco: Parametros do PWM real do motor no ESP32 Arduino Core 3.x.
 static const uint16_t MOTOR_PWM_FREQ = 2000;
 static const uint8_t MOTOR_PWM_RESOLUTION = 8;
 static const uint8_t MOTOR_PWM_WASH = 140;
@@ -148,7 +147,7 @@ void writeMcpOutput(uint8_t pin, bool level) {
 
 // Bloco: Controla o PWM real do motor no pino do ESP32.
 void setMotorDuty(uint8_t duty) {
-  ledcWrite(MOTOR_PWM_CHANNEL, duty);
+  ledcWrite(MOTOR_PWM_PIN, duty);
 }
 
 // Bloco: Liga ou desliga a valvula de entrada de agua.
@@ -648,8 +647,10 @@ void setupHardware() {
   analogSetAttenuation(ADC_11db);
   pinMode(ADC_NIVEL, INPUT);
 
-  ledcSetup(MOTOR_PWM_CHANNEL, MOTOR_PWM_FREQ, MOTOR_PWM_RESOLUTION);
-  ledcAttachPin(MOTOR_PWM_PIN, MOTOR_PWM_CHANNEL);
+  bool pwmOk = ledcAttach(MOTOR_PWM_PIN, MOTOR_PWM_FREQ, MOTOR_PWM_RESOLUTION);
+  if (!pwmOk) {
+    Serial.println("PWM FAIL");
+  }
   setMotorDuty(0);
 
   lcd.init();
